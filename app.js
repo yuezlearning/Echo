@@ -1,4 +1,19 @@
 // Flash Card App - Language Learning Tool
+import { initializeApp } from "https://www.gstatic.com/firebasejs/11.0.0/firebase-app.js";
+import { getFirestore } from "https://www.gstatic.com/firebasejs/11.0.0/firebase-firestore.js";
+
+const firebaseConfig = {
+  apiKey: "AIzaSyDp5ttNGNvqMIKkqP9iv7sGk1NyHaihKEY",
+  authDomain: "echo-a3d75.firebaseapp.com",
+  projectId: "echo-a3d75",
+  storageBucket: "echo-a3d75.firebasestorage.app",
+  messagingSenderId: "157219045889",
+  appId: "1:157219045889:web:93298a40ef07c61d28f600"
+};
+
+const app = initializeApp(firebaseConfig);
+const db = getFirestore(app);
+
 (function() {
     'use strict';
 
