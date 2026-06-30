@@ -4,7 +4,10 @@ import {
   createUserWithEmailAndPassword,
   signInWithEmailAndPassword,
   signOut,
-  onAuthStateChanged
+  onAuthStateChanged,
+  GoogleAuthProvider,
+  signInWithPopup,
+  signInAnonymously
 } from "https://www.gstatic.com/firebasejs/11.0.0/firebase-auth.js";
 import {
   getFirestore,
@@ -141,6 +144,18 @@ const db = getFirestore(app);
                 background: #ff5a1f; color: #fff; font-size: 15px; font-weight: 600;
             }
             #auth-submit:disabled { opacity: .6; cursor: default; }
+            #auth-google {
+                width: 100%; padding: 11px; margin-top: 8px; cursor: pointer;
+                border: 1px solid #d4d7dd; border-radius: 8px;
+                background: #fff; color: #1e2327; font-size: 15px; font-weight: 600;
+            }
+            #auth-google:hover { background: #f7f8fa; }
+            #auth-guest {
+                width: 100%; padding: 11px; margin-top: 8px; cursor: pointer;
+                border: 1px solid #d4d7dd; border-radius: 8px;
+                background: #fff; color: #666; font-size: 14px; font-weight: 500;
+            }
+            #auth-guest:hover { background: #f7f8fa; }
             #auth-error { color: #c0392b; font-size: 13px; min-height: 18px; margin: 4px 0 0; }
             #auth-toggle { margin-top: 14px; font-size: 13px; text-align: center; color: #666; }
             #auth-toggle a { color: #ff5a1f; cursor: pointer; text-decoration: underline; }
@@ -162,6 +177,8 @@ const db = getFirestore(app);
                 <input id="auth-email" type="email" placeholder="Email" autocomplete="email" />
                 <input id="auth-password" type="password" placeholder="Password" autocomplete="current-password" />
                 <button id="auth-submit">Log in</button>
+                <button id="auth-google" type="button">Continue with Google</button>
+                <button id="auth-guest" type="button">Continue as guest</button>
                 <p id="auth-error"></p>
                 <p id="auth-toggle">No account? <a id="auth-toggle-link">Sign up</a></p>
             </div>
@@ -185,7 +202,37 @@ const db = getFirestore(app);
             if (e.key === 'Enter') handleAuthSubmit();
         });
         authToggle.addEventListener('click', toggleAuthMode);
-        logoutBtn.addEventListener('click', () => signOut(auth));
+        logoutBtn.addEventListener('click', () => {
+            // Anonymous accounts cannot be signed back into once you leave,
+            // so warn before logging out and losing that guest's cards.
+            if (currentUser && currentUser.isAnonymous) {
+                if (!confirm('You are signed in as a guest. Logging out permanently deletes this guest account and its cards. Continue?')) {
+                    return;
+                }
+            }
+            signOut(auth);
+        });
+
+        const googleProvider = new GoogleAuthProvider();
+        document.getElementById('auth-google').addEventListener('click', async () => {
+            authError.textContent = '';
+            try {
+                await signInWithPopup(auth, googleProvider);
+                // onAuthStateChanged takes over from here.
+            } catch (e) {
+                authError.textContent = friendlyAuthError(e.code);
+            }
+        });
+
+        document.getElementById('auth-guest').addEventListener('click', async () => {
+            authError.textContent = '';
+            try {
+                await signInAnonymously(auth);
+                // onAuthStateChanged takes over from here.
+            } catch (e) {
+                authError.textContent = friendlyAuthError(e.code);
+            }
+        });
     }
 
     function toggleAuthMode() {
@@ -244,6 +291,11 @@ const db = getFirestore(app);
             case 'auth/wrong-password':
             case 'auth/user-not-found': return 'Email or password is incorrect.';
             case 'auth/too-many-requests': return 'Too many attempts. Try again later.';
+            case 'auth/popup-closed-by-user':
+            case 'auth/cancelled-popup-request': return '';
+            case 'auth/popup-blocked': return 'Your browser blocked the popup. Allow popups and try again.';
+            case 'auth/account-exists-with-different-credential':
+                return 'This email already has an account using a different sign-in method.';
             default: return 'Something went wrong. Please try again.';
         }
     }
