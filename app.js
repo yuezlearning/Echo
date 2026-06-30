@@ -6,7 +6,12 @@ import {
   signOut,
   onAuthStateChanged
 } from "https://www.gstatic.com/firebasejs/11.0.0/firebase-auth.js";
-import { getFirestore } from "https://www.gstatic.com/firebasejs/11.0.0/firebase-firestore.js";
+import {
+  getFirestore,
+  doc,
+  getDoc,
+  setDoc
+} from "https://www.gstatic.com/firebasejs/11.0.0/firebase-firestore.js";
 
 const firebaseConfig = {
   apiKey: "AIzaSyDp5ttNGNvqMIKkqP9iv7sGk1NyHaihKEY",
@@ -26,6 +31,8 @@ const db = getFirestore(app);
     'use strict';
 
     // ==================== State ====================
+    // NOTE: localStorage keys are kept only for a one-time migration of any
+    // cards you already created locally before Firebase was added.
     const STORAGE_KEYS = {
         CARDS: 'flashcards_cards',
         STATS: 'flashcards_stats',
@@ -43,6 +50,17 @@ const db = getFirestore(app);
         lastSessionDate: null
     };
     let activity = [];
+
+    let currentUser = null;   // set by onAuthStateChanged
+    let saveTimer = null;     // debounce handle for cloud writes
+    let listenersBound = false;
+
+    function defaultStats() {
+        return {
+            correct: 0, wrong: 0, streak: 0,
+            bestStreak: 0, sessions: 0, lastSessionDate: null
+        };
+    }
 
     // ==================== DOM Elements ====================
     const navButtons = document.querySelectorAll('.nav-btn');
@@ -91,45 +109,212 @@ const db = getFirestore(app);
     // Toast
     const toast = document.getElementById('toast');
 
-    // ==================== Initialization ====================
-    function init() {
-        loadData();
-        setupEventListeners();
-        updateCardsView();
-        updateWordList();
-        updateStats();
-        trackSession();
+    // ==================== Auth UI (injected) ====================
+    // Built in JS so you only have to replace app.js, not edit index.html.
+    let authOverlay, authEmail, authPassword, authError, authSubmit, authToggle;
+    let logoutBtn;
+    let authMode = 'login'; // 'login' | 'signup'
+
+    function buildAuthUI() {
+        const style = document.createElement('style');
+        style.textContent = `
+            #auth-overlay {
+                position: fixed; inset: 0; z-index: 9999;
+                display: flex; align-items: center; justify-content: center;
+                background: rgba(20,22,26,0.92); padding: 20px;
+                font-family: inherit;
+            }
+            #auth-overlay.hidden { display: none; }
+            #auth-card {
+                width: 100%; max-width: 340px; background: #fff; color: #1e2327;
+                border-radius: 14px; padding: 28px 24px; box-shadow: 0 12px 40px rgba(0,0,0,.3);
+            }
+            #auth-card h2 { margin: 0 0 4px; font-size: 22px; }
+            #auth-card p.sub { margin: 0 0 18px; font-size: 13px; color: #666; }
+            #auth-card input {
+                width: 100%; box-sizing: border-box; padding: 11px 12px; margin-bottom: 10px;
+                border: 1px solid #d4d7dd; border-radius: 8px; font-size: 15px;
+            }
+            #auth-card input:focus { outline: none; border-color: #ff7a45; }
+            #auth-submit {
+                width: 100%; padding: 11px; border: 0; border-radius: 8px; cursor: pointer;
+                background: #ff5a1f; color: #fff; font-size: 15px; font-weight: 600;
+            }
+            #auth-submit:disabled { opacity: .6; cursor: default; }
+            #auth-error { color: #c0392b; font-size: 13px; min-height: 18px; margin: 4px 0 0; }
+            #auth-toggle { margin-top: 14px; font-size: 13px; text-align: center; color: #666; }
+            #auth-toggle a { color: #ff5a1f; cursor: pointer; text-decoration: underline; }
+            #logout-btn {
+                position: fixed; top: 12px; right: 12px; z-index: 9000;
+                padding: 7px 12px; border: 1px solid #d4d7dd; border-radius: 8px;
+                background: #fff; color: #1e2327; font-size: 13px; cursor: pointer;
+            }
+            #logout-btn.hidden { display: none; }
+        `;
+        document.head.appendChild(style);
+
+        authOverlay = document.createElement('div');
+        authOverlay.id = 'auth-overlay';
+        authOverlay.innerHTML = `
+            <div id="auth-card">
+                <h2 id="auth-title">Welcome back</h2>
+                <p class="sub" id="auth-sub">Log in to sync your cards across devices.</p>
+                <input id="auth-email" type="email" placeholder="Email" autocomplete="email" />
+                <input id="auth-password" type="password" placeholder="Password" autocomplete="current-password" />
+                <button id="auth-submit">Log in</button>
+                <p id="auth-error"></p>
+                <p id="auth-toggle">No account? <a id="auth-toggle-link">Sign up</a></p>
+            </div>
+        `;
+        document.body.appendChild(authOverlay);
+
+        logoutBtn = document.createElement('button');
+        logoutBtn.id = 'logout-btn';
+        logoutBtn.className = 'hidden';
+        logoutBtn.textContent = 'Log out';
+        document.body.appendChild(logoutBtn);
+
+        authEmail = document.getElementById('auth-email');
+        authPassword = document.getElementById('auth-password');
+        authError = document.getElementById('auth-error');
+        authSubmit = document.getElementById('auth-submit');
+        authToggle = document.getElementById('auth-toggle-link');
+
+        authSubmit.addEventListener('click', handleAuthSubmit);
+        authPassword.addEventListener('keydown', (e) => {
+            if (e.key === 'Enter') handleAuthSubmit();
+        });
+        authToggle.addEventListener('click', toggleAuthMode);
+        logoutBtn.addEventListener('click', () => signOut(auth));
     }
 
-    // ==================== Data Persistence ====================
-    function loadData() {
+    function toggleAuthMode() {
+        authMode = authMode === 'login' ? 'signup' : 'login';
+        authError.textContent = '';
+        const title = document.getElementById('auth-title');
+        const sub = document.getElementById('auth-sub');
+        const toggleP = document.getElementById('auth-toggle');
+        if (authMode === 'login') {
+            title.textContent = 'Welcome back';
+            sub.textContent = 'Log in to sync your cards across devices.';
+            authSubmit.textContent = 'Log in';
+            authPassword.setAttribute('autocomplete', 'current-password');
+            toggleP.innerHTML = 'No account? <a id="auth-toggle-link">Sign up</a>';
+        } else {
+            title.textContent = 'Create account';
+            sub.textContent = 'Sign up to start saving your cards to the cloud.';
+            authSubmit.textContent = 'Sign up';
+            authPassword.setAttribute('autocomplete', 'new-password');
+            toggleP.innerHTML = 'Have an account? <a id="auth-toggle-link">Log in</a>';
+        }
+        authToggle = document.getElementById('auth-toggle-link');
+        authToggle.addEventListener('click', toggleAuthMode);
+    }
+
+    async function handleAuthSubmit() {
+        const email = authEmail.value.trim();
+        const password = authPassword.value;
+        if (!email || !password) {
+            authError.textContent = 'Enter an email and password.';
+            return;
+        }
+        authSubmit.disabled = true;
+        authError.textContent = '';
+        try {
+            if (authMode === 'signup') {
+                await createUserWithEmailAndPassword(auth, email, password);
+            } else {
+                await signInWithEmailAndPassword(auth, email, password);
+            }
+            // onAuthStateChanged takes over from here.
+        } catch (e) {
+            authError.textContent = friendlyAuthError(e.code);
+        } finally {
+            authSubmit.disabled = false;
+        }
+    }
+
+    function friendlyAuthError(code) {
+        switch (code) {
+            case 'auth/invalid-email': return 'That email looks invalid.';
+            case 'auth/missing-password': return 'Enter a password.';
+            case 'auth/weak-password': return 'Password should be at least 6 characters.';
+            case 'auth/email-already-in-use': return 'That email already has an account. Try logging in.';
+            case 'auth/invalid-credential':
+            case 'auth/wrong-password':
+            case 'auth/user-not-found': return 'Email or password is incorrect.';
+            case 'auth/too-many-requests': return 'Too many attempts. Try again later.';
+            default: return 'Something went wrong. Please try again.';
+        }
+    }
+
+    // ==================== Data Persistence (Firestore) ====================
+    function userDocRef() {
+        return doc(db, 'users', currentUser.uid);
+    }
+
+    async function loadData() {
+        try {
+            const snap = await getDoc(userDocRef());
+            if (snap.exists()) {
+                const data = snap.data();
+                cards = Array.isArray(data.cards) ? data.cards : [];
+                stats = { ...defaultStats(), ...(data.stats || {}) };
+                activity = Array.isArray(data.activity) ? data.activity : [];
+            } else {
+                // First time this user signs in. Migrate any local cards once,
+                // then the cloud copy becomes the source of truth.
+                migrateFromLocalStorage();
+                await saveNow();
+            }
+        } catch (e) {
+            console.error('Error loading from Firestore:', e);
+            cards = [];
+            stats = defaultStats();
+            activity = [];
+        }
+    }
+
+    function migrateFromLocalStorage() {
         try {
             const savedCards = localStorage.getItem(STORAGE_KEYS.CARDS);
             const savedStats = localStorage.getItem(STORAGE_KEYS.STATS);
             const savedActivity = localStorage.getItem(STORAGE_KEYS.ACTIVITY);
-
             if (savedCards) cards = JSON.parse(savedCards);
-            if (savedStats) stats = { ...stats, ...JSON.parse(savedStats) };
+            if (savedStats) stats = { ...defaultStats(), ...JSON.parse(savedStats) };
             if (savedActivity) activity = JSON.parse(savedActivity);
         } catch (e) {
-            console.error('Error loading data:', e);
+            console.error('Migration skipped:', e);
         }
     }
 
-    function saveCards() {
-        localStorage.setItem(STORAGE_KEYS.CARDS, JSON.stringify(cards));
+    // Write the whole user document. All three former save functions now route
+    // here so a single debounced write covers cards + stats + activity together.
+    async function saveNow() {
+        if (!currentUser) return;
+        try {
+            await setDoc(userDocRef(), { cards, stats, activity }, { merge: true });
+        } catch (e) {
+            console.error('Error saving to Firestore:', e);
+        }
     }
 
-    function saveStats() {
-        localStorage.setItem(STORAGE_KEYS.STATS, JSON.stringify(stats));
+    function scheduleSave() {
+        if (!currentUser) return;
+        clearTimeout(saveTimer);
+        saveTimer = setTimeout(saveNow, 700);
     }
 
-    function saveActivity() {
-        localStorage.setItem(STORAGE_KEYS.ACTIVITY, JSON.stringify(activity));
-    }
+    // Kept the original names so the rest of the app is unchanged.
+    function saveCards() { scheduleSave(); }
+    function saveStats() { scheduleSave(); }
+    function saveActivity() { scheduleSave(); }
 
     // ==================== Navigation ====================
     function setupEventListeners() {
+        if (listenersBound) return; // attach DOM listeners only once
+        listenersBound = true;
+
         // Navigation
         navButtons.forEach(btn => {
             btn.addEventListener('click', () => switchView(btn.dataset.view));
@@ -272,8 +457,13 @@ const db = getFirestore(app);
 
     // ==================== Keyboard & Swipe ====================
     function handleKeyboard(e) {
+        // Don't hijack keys while the login overlay is open or typing in inputs.
+        if (authOverlay && !authOverlay.classList.contains('hidden')) return;
+        const tag = (e.target.tagName || '').toLowerCase();
+        if (tag === 'input' || tag === 'textarea') return;
+
         const activeView = document.querySelector('.view.active');
-        if (activeView.id !== 'view-cards') return;
+        if (!activeView || activeView.id !== 'view-cards') return;
         if (cards.length === 0) return;
 
         switch(e.key) {
@@ -429,7 +619,6 @@ const db = getFirestore(app);
     }
 
     function processFile(file) {
-        const validTypes = ['text/csv', 'text/plain', 'text/tab-separated-values', ''];
         const validExtensions = ['.csv', '.txt', '.tsv'];
         const ext = '.' + file.name.split('.').pop().toLowerCase();
 
@@ -600,14 +789,7 @@ const db = getFirestore(app);
     function resetStats() {
         if (!confirm('Reset all statistics? This cannot be undone.')) return;
 
-        stats = {
-            correct: 0,
-            wrong: 0,
-            streak: 0,
-            bestStreak: 0,
-            sessions: 0,
-            lastSessionDate: null
-        };
+        stats = defaultStats();
         activity = [];
 
         // Reset card-level stats
@@ -628,20 +810,11 @@ const db = getFirestore(app);
         if (!confirm('Delete ALL data including cards? This cannot be undone.')) return;
 
         cards = [];
-        stats = {
-            correct: 0,
-            wrong: 0,
-            streak: 0,
-            bestStreak: 0,
-            sessions: 0,
-            lastSessionDate: null
-        };
+        stats = defaultStats();
         activity = [];
         currentIndex = 0;
 
-        localStorage.removeItem(STORAGE_KEYS.CARDS);
-        localStorage.removeItem(STORAGE_KEYS.STATS);
-        localStorage.removeItem(STORAGE_KEYS.ACTIVITY);
+        saveNow(); // push the cleared state to the cloud immediately
 
         updateCardsView();
         updateWordList();
@@ -689,6 +862,45 @@ const db = getFirestore(app);
         deleteCard
     };
 
-    // ==================== Start ====================
-    init();
+    // ==================== Auth-driven startup ====================
+    async function onLogin(user) {
+        currentUser = user;
+        currentIndex = 0;
+        await loadData();
+        setupEventListeners();   // bind once
+        trackSession();
+        updateCardsView();
+        updateWordList();
+        updateStats();
+
+        authOverlay.classList.add('hidden');
+        logoutBtn.classList.remove('hidden');
+    }
+
+    function onLogout() {
+        currentUser = null;
+        clearTimeout(saveTimer);
+        cards = [];
+        stats = defaultStats();
+        activity = [];
+        currentIndex = 0;
+
+        authOverlay.classList.remove('hidden');
+        logoutBtn.classList.add('hidden');
+        authPassword.value = '';
+        authError.textContent = '';
+    }
+
+    function start() {
+        buildAuthUI();
+        onAuthStateChanged(auth, (user) => {
+            if (user) {
+                onLogin(user);
+            } else {
+                onLogout();
+            }
+        });
+    }
+
+    start();
 })();
